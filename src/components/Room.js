@@ -2,48 +2,74 @@ import React, { useEffect, useRef, useState } from 'react';
 import { useParams } from 'react-router-dom';
 import { io } from 'socket.io-client';
 
-const socket = io('http://localhost:5000');
+const socket = io('https://your-backend-url.vercel.app');
 
 const Room = () => {
   const { roomId } = useParams();
   const [myStream, setMyStream] = useState(null);
   const [remoteStream, setRemoteStream] = useState(null);
+  const [peerConnection, setPeerConnection] = useState(null);
 
   const myVideoRef = useRef();
   const remoteVideoRef = useRef();
 
   useEffect(() => {
-    navigator.mediaDevices.getUserMedia({ video: true, audio: true })
-      .then(stream => {
-        setMyStream(stream);
-        myVideoRef.current.srcObject = stream;
+    const init = async () => {
+      const stream = await navigator.mediaDevices.getUserMedia({ video: true, audio: true });
+      setMyStream(stream);
+      myVideoRef.current.srcObject = stream;
 
-        socket.emit('join-room', roomId);
+      socket.emit('join-room', roomId);
 
-        socket.on('user-connected', userId => {
-          console.log('User connected:', userId);
-          // Implement WebRTC connection logic here
-        });
+      const pc = new RTCPeerConnection();
+      stream.getTracks().forEach(track => pc.addTrack(track, stream));
 
-        socket.on('call-made', async data => {
-          const offer = data.offer;
-          const peerConnection = new RTCPeerConnection();
-          peerConnection.ontrack = event => {
-            setRemoteStream(event.streams[0]);
-            remoteVideoRef.current.srcObject = event.streams[0];
-          };
-          myStream.getTracks().forEach(track => peerConnection.addTrack(track, myStream));
-          await peerConnection.setRemoteDescription(new RTCSessionDescription(offer));
-          const answer = await peerConnection.createAnswer();
-          await peerConnection.setLocalDescription(new RTCSessionDescription(answer));
-          socket.emit('make-answer', { answer, roomId });
-        });
+      pc.ontrack = event => {
+        if (event.streams && event.streams[0]) {
+          setRemoteStream(event.streams[0]);
+          remoteVideoRef.current.srcObject = event.streams[0];
+        }
+      };
+
+      pc.onicecandidate = event => {
+        if (event.candidate) {
+          socket.emit('candidate', { candidate: event.candidate, roomId });
+        }
+      };
+
+      socket.on('offer', async payload => {
+        await pc.setRemoteDescription(new RTCSessionDescription(payload.sdp));
+        const answer = await pc.createAnswer();
+        await pc.setLocalDescription(new RTCSessionDescription(answer));
+        socket.emit('answer', { sdp: answer, roomId });
       });
+
+      socket.on('answer', async payload => {
+        await pc.setRemoteDescription(new RTCSessionDescription(payload.sdp));
+      });
+
+      socket.on('candidate', async payload => {
+        await pc.addIceCandidate(new RTCIceCandidate(payload.candidate));
+      });
+
+      setPeerConnection(pc);
+
+      if (stream) {
+        const offer = await pc.createOffer();
+        await pc.setLocalDescription(new RTCSessionDescription(offer));
+        socket.emit('offer', { sdp: offer, roomId });
+      }
+    };
+
+    init();
 
     return () => {
       socket.emit('leave-room', roomId);
+      if (peerConnection) {
+        peerConnection.close();
+      }
     };
-  }, [roomId]);
+  }, [roomId, peerConnection]);
 
   return (
     <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', marginTop: '50px' }}>
